@@ -3,11 +3,13 @@ from __future__ import annotations
 import csv
 import io
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from flask import Flask, request, render_template_string, Response
+from flask import Flask, request, render_template_string, Response, jsonify
+from threading import Thread, Lock
 
 try:
 	import fitz
@@ -18,8 +20,7 @@ except Exception as e:
 
 app = Flask(__name__)
 
-DEFAULT_BASE_DIR = r"P:\\2025 Run Data"
-REN_FOLDERS = ["Ren A", "Ren B", "Ren C"]
+DEFAULT_BASE_DIR = r"P:\\Client Data\\Carlsmed\\~Purchase Orders"
 PART_TYPES = ["ALIF", "LLIF", "ALIF-X", "TLIF-C", "TLIF-O", "TLIF-CA"]
 
 FLOAT = r"[-+]?(?:\d+\.\d+|\d+)"
@@ -36,35 +37,33 @@ PLAN_LABELS = {0: "Minus 01", 1: "Plan 02", 2: "Plus 03"}
 @dataclass
 class Thresholds:
 	ap_depth_b_mm: Optional[float]
+	ap_op: str
 	ml_width_a_mm: Optional[float]
+	ml_op: str
 	max_cage_height_c_mm: Optional[float]
+	max_op: str
 
 
-def iter_job_cmd_dirs(base_dir: Path, rens: Sequence[str]) -> Iterable[Path]:
-	for ren in rens:
-		ren_dir = base_dir / ren
-		try:
-			if not ren_dir.is_dir():
-				continue
-			for job_dir in ren_dir.iterdir():
-				if not job_dir.is_dir():
-					continue
-				cmd_dir = job_dir / "Docs" / "CMD"
-				if cmd_dir.is_dir():
-					yield cmd_dir
-		except Exception as exc:
-			print(f"Error scanning ren folder {ren_dir}: {exc}")
+def iter_po_dirs(base_dir: Path) -> Iterable[Path]:
+	try:
+		if not base_dir.is_dir():
+			return
+		for po_dir in base_dir.iterdir():
+			if po_dir.is_dir():
+				yield po_dir
+	except Exception as exc:
+		print(f"Error scanning base folder {base_dir}: {exc}")
 
 
-def find_form19_pdfs(cmd_path: Path) -> List[Path]:
+def find_form19_pdfs(root_path: Path) -> List[Path]:
 	pdfs: List[Path] = []
 	try:
-		for p in cmd_path.rglob("*.pdf"):
+		for p in root_path.rglob("*.pdf"):
 			name_lower = p.name.lower()
 			if ("form-019" in name_lower) or ("form-19" in name_lower):
 				pdfs.append(p)
 	except Exception as exc:
-		print(f"Error while searching PDFs in {cmd_path}: {exc}")
+		print(f"Error while searching PDFs in {root_path}: {exc}")
 	return pdfs
 
 
@@ -77,10 +76,10 @@ def _parse_three_numbers(match: Optional[re.Match]) -> Optional[Tuple[float, flo
 		return None
 
 
-def _extract_po_from_path(pdf_path: Path, cmd_root: Path) -> str:
+def _extract_po_from_path(pdf_path: Path, stop_at: Optional[Path] = None) -> str:
 	try:
 		for parent in [pdf_path.parent, *pdf_path.parents]:
-			if parent == cmd_root:
+			if stop_at is not None and parent == stop_at:
 				break
 			m = RE_PO.search(parent.name)
 			if m:
@@ -88,6 +87,14 @@ def _extract_po_from_path(pdf_path: Path, cmd_root: Path) -> str:
 	except Exception:
 		pass
 	return ""
+
+
+def _cmp(value: float, threshold: Optional[float], op: str) -> bool:
+	if threshold is None:
+		return True
+	if op == "<=":
+		return value <= threshold
+	return value >= threshold
 
 
 def scan_pdf(pdf_path: Path, part_type: str, thresholds: Thresholds) -> List[Dict[str, object]]:
@@ -100,11 +107,6 @@ def scan_pdf(pdf_path: Path, part_type: str, thresholds: Thresholds) -> List[Dic
 	except Exception as exc:
 		print(f"Failed to open PDF {pdf_path}: {exc}")
 		return results
-	cmd_root_guess = None
-	for ancestor in pdf_path.parents:
-		if ancestor.name.lower() == "cmd":
-			cmd_root_guess = ancestor
-			break
 	try:
 		for page in doc:
 			text = page.get_text("text")
@@ -120,17 +122,17 @@ def scan_pdf(pdf_path: Path, part_type: str, thresholds: Thresholds) -> List[Dic
 			implant_names = RE_IMPLANT.findall(text)
 			lot_match = RE_LOT.search(text)
 			lot = lot_match.group(0) if lot_match else ""
-			po = _extract_po_from_path(pdf_path, cmd_root_guess or pdf_path.parent)
+			po = _extract_po_from_path(pdf_path, None)
 			for idx in (0, 1, 2):
 				ap_v = ap_vals[idx]
 				ml_v = ml_vals[idx]
 				maxh_v = maxh_vals[idx]
 				ok = True
-				if thresholds.ap_depth_b_mm is not None and ap_v < thresholds.ap_depth_b_mm:
+				if not _cmp(ap_v, thresholds.ap_depth_b_mm, thresholds.ap_op):
 					ok = False
-				if thresholds.ml_width_a_mm is not None and ml_v < thresholds.ml_width_a_mm:
+				if not _cmp(ml_v, thresholds.ml_width_a_mm, thresholds.ml_op):
 					ok = False
-				if thresholds.max_cage_height_c_mm is not None and maxh_v < thresholds.max_cage_height_c_mm:
+				if not _cmp(maxh_v, thresholds.max_cage_height_c_mm, thresholds.max_op):
 					ok = False
 				if not ok:
 					continue
@@ -171,6 +173,42 @@ def results_to_csv(rows: Sequence[Dict[str, object]]) -> str:
 	return buf.getvalue()
 
 
+# Background job store
+JOBS: Dict[str, Dict[str, object]] = {}
+JOBS_LOCK = Lock()
+
+
+def _gather_pdfs(base_dir: Path) -> List[Path]:
+	pdfs: List[Path] = []
+	for po_dir in iter_po_dirs(base_dir):
+		pdfs.extend(find_form19_pdfs(po_dir))
+	return pdfs
+
+
+def _run_job(job_id: str, base_dir: Path, part_type: str, thresholds: Thresholds) -> None:
+	try:
+		pdfs = _gather_pdfs(base_dir)
+		with JOBS_LOCK:
+			JOBS[job_id]["total"] = len(pdfs)
+		processed = 0
+		results: List[Dict[str, object]] = []
+		for pdf in pdfs:
+			rows = scan_pdf(pdf, part_type, thresholds)
+			results.extend(rows)
+			processed += 1
+			with JOBS_LOCK:
+				JOBS[job_id]["processed"] = processed
+		csv_data = results_to_csv(results)
+		with JOBS_LOCK:
+			JOBS[job_id]["results"] = results
+			JOBS[job_id]["csv"] = csv_data
+			JOBS[job_id]["done"] = True
+	except Exception as exc:
+		with JOBS_LOCK:
+			JOBS[job_id]["error"] = str(exc)
+			JOBS[job_id]["done"] = True
+
+
 TEMPLATE = """
 <!doctype html>
 <html>
@@ -178,98 +216,138 @@ TEMPLATE = """
 	<meta charset="utf-8" />
 	<title>FORM-019 Finder</title>
 	<style>
-		body { font-family: Arial, sans-serif; margin: 20px; }
-		label { display: inline-block; margin: 6px 0; }
-		input[type=text], select, input[type=number] { padding: 6px; width: 320px; }
-		fieldset { border: 1px solid #ccc; padding: 10px 14px; margin-bottom: 12px; }
-		legend { padding: 0 6px; }
-		button { padding: 8px 14px; }
+		:root { --radius: 8px; --border: #d0d5dd; --focus: #4f8cff; }
+		* { box-sizing: border-box; }
+		body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; margin: 20px; color: #111827; }
+		label { display: block; margin: 10px 0 6px; font-weight: 600; }
+		input[type=text], select, input[type=number] { padding: 8px 10px; height: 36px; border-radius: var(--radius); border: 1px solid var(--border); background: #fff; outline: none; }
+		input[type=text].wide { width: min(900px, 100%); }
+		select.wide { width: 320px; max-width: 100%; }
+		.inline { display: flex; gap: 8px; align-items: center; }
+		.inline .op { width: 64px; text-align: center; }
+		.inline .num { width: 180px; }
+		fieldset { border: 1px solid #e5e7eb; padding: 14px 16px; margin-bottom: 14px; border-radius: var(--radius); background: #fafafa; }
+		legend { padding: 0 6px; font-weight: 700; }
+		button { padding: 9px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: #111827; color: #fff; cursor: pointer; }
+		button:hover { background: #0b1220; }
+		input:focus, select:focus { border-color: var(--focus); box-shadow: 0 0 0 3px rgba(79,140,255,0.2); }
 		table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-		th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; }
-		th { background: #f2f2f2; }
-		.small { color: #666; font-size: 12px; }
+		th, td { border: 1px solid #e5e7eb; padding: 8px 10px; text-align: left; }
+		th { background: #f9fafb; }
+		.small { color: #6b7280; font-size: 12px; }
+		.progress { width: 100%; background: #eee; height: 14px; border-radius: 7px; overflow: hidden; margin: 10px 0; }
+		.bar { height: 100%; background: #4caf50; width: 0%; transition: width 0.2s; }
 	</style>
 </head>
 <body>
 	<h2>FORM-019 Finder</h2>
-	<form method="post" action="/">
+	<form id="searchForm" method="post" action="/start">
 		<fieldset>
 			<legend>Search Scope</legend>
-			<label>Base Folder:<br>
-				<input type="text" name="base_dir" value="{{ base_dir }}" />
-			</label>
-			<div>
-				<label><input type="checkbox" name="ren" value="Ren A" {% if 'Ren A' in selected_rens %}checked{% endif %}> Ren A</label>
-				<label><input type="checkbox" name="ren" value="Ren B" {% if 'Ren B' in selected_rens %}checked{% endif %}> Ren B</label>
-				<label><input type="checkbox" name="ren" value="Ren C" {% if 'Ren C' in selected_rens %}checked{% endif %}> Ren C</label>
-			</div>
+			<label>Base Folder</label>
+			<input class="wide" type="text" name="base_dir" value="{{ base_dir }}" />
 		</fieldset>
 		<fieldset>
 			<legend>Filters</legend>
-			<label>Part Type:<br>
-				<select name="part_type">
-					{% for pt in part_types %}
-						<option value="{{ pt }}" {% if pt == part_type %}selected{% endif %}>{{ pt }}</option>
-					{% endfor %}
-				</select>
-			</label>
-			<div>
-				<label>AP Depth “B” (mm) ≥<br>
-					<input type="number" step="0.01" name="ap_b" value="{{ ap_b|default('') }}" />
-				</label>
+			<label>Part Type</label>
+			<select class="wide" name="part_type">
+				{% for pt in part_types %}
+					<option value="{{ pt }}" {% if pt == part_type %}selected{% endif %}>{{ pt }}</option>
+				{% endfor %}
+			</select>
+			<label>AP Depth “B” (mm)</label>
+			<div class="inline">
+				<select class="op" name="ap_op"><option value=">=" selected>≥</option><option value="<=">≤</option></select>
+				<input class="num" type="number" step="0.01" name="ap_b" value="{{ ap_b|default('') }}" />
 			</div>
-			<div>
-				<label>ML Width “A” (mm) ≥<br>
-					<input type="number" step="0.01" name="ml_a" value="{{ ml_a|default('') }}" />
-				</label>
+			<label>ML Width “A” (mm)</label>
+			<div class="inline">
+				<select class="op" name="ml_op"><option value=">=" selected>≥</option><option value="<=">≤</option></select>
+				<input class="num" type="number" step="0.01" name="ml_a" value="{{ ml_a|default('') }}" />
 			</div>
-			<div>
-				<label>Max Cage Height “C” (mm) ≥<br>
-					<input type="number" step="0.01" name="max_c" value="{{ max_c|default('') }}" />
-				</label>
+			<label>Max Cage Height “C” (mm)</label>
+			<div class="inline">
+				<select class="op" name="max_op"><option value=">=" selected>≥</option><option value="<=">≤</option></select>
+				<input class="num" type="number" step="0.01" name="max_c" value="{{ max_c|default('') }}" />
 			</div>
 		</fieldset>
 		<button type="submit">Search</button>
 	</form>
-	{% if results is defined %}
-		<h3>Matches: {{ results|length }}</h3>
-		{% if results|length > 0 %}
-			<table>
-				<thead>
-					<tr>
-						<th>PO</th>
-						<th>Lot</th>
-						<th>PartType</th>
-						<th>Plan</th>
-						<th>ImplantName</th>
-						<th>AP_Depth_B_mm</th>
-						<th>ML_Width_A_mm</th>
-						<th>Max_Cage_Height_C_mm</th>
-						<th>PDF</th>
-					</tr>
-				</thead>
-				<tbody>
-					{% for r in results %}
-					<tr>
-						<td>{{ r.PO }}</td>
-						<td>{{ r.Lot }}</td>
-						<td>{{ r.PartType }}</td>
-						<td>{{ r.Plan }}</td>
-						<td>{{ r.ImplantName }}</td>
-						<td>{{ r.AP_Depth_B_mm }}</td>
-						<td>{{ r.ML_Width_A_mm }}</td>
-						<td>{{ r.Max_Cage_Height_C_mm }}</td>
-						<td class="small">{{ r.PDF }}</td>
-					</tr>
-					{% endfor %}
-				</tbody>
-			</table>
-			<form method="post" action="/download">
-				<textarea name="csv" style="display:none;">{{ csv_data }}</textarea>
-				<button type="submit">Download CSV</button>
-			</form>
-		{% endif %}
-	{% endif %}
+
+	<div id="progressWrap" style="display:none;">
+		<div class="progress"><div id="bar" class="bar"></div></div>
+		<div id="progressText">Starting…</div>
+	</div>
+
+	<div id="resultsWrap"></div>
+
+	<script>
+	(function() {
+		const form = document.getElementById('searchForm');
+		const progressWrap = document.getElementById('progressWrap');
+		const bar = document.getElementById('bar');
+		const progressText = document.getElementById('progressText');
+		const resultsWrap = document.getElementById('resultsWrap');
+		let pollTimer = null;
+
+		function renderTable(rows) {
+			if (!rows || rows.length === 0) { resultsWrap.innerHTML = '<p>No matches.</p>'; return; }
+			let html = '<table><thead><tr>'+
+				'<th>PO</th><th>Lot</th><th>PartType</th><th>Plan</th><th>ImplantName</th>'+
+				'<th>AP_Depth_B_mm</th><th>ML_Width_A_mm</th><th>Max_Cage_Height_C_mm</th><th>PDF</th>'+
+				'</tr></thead><tbody>';
+			for (const r of rows) {
+				html += '<tr>'+
+					`<td>${r.PO||''}</td>`+
+					`<td>${r.Lot||''}</td>`+
+					`<td>${r.PartType||''}</td>`+
+					`<td>${r.Plan||''}</td>`+
+					`<td>${r.ImplantName||''}</td>`+
+					`<td>${r.AP_Depth_B_mm||''}</td>`+
+					`<td>${r.ML_Width_A_mm||''}</td>`+
+					`<td>${r.Max_Cage_Height_C_mm||''}</td>`+
+					`<td class="small">${r.PDF||''}</td>`+
+					'</tr>';
+			}
+			html += '</tbody></table>';
+			resultsWrap.innerHTML = html;
+		}
+
+		form.addEventListener('submit', async function(e) {
+			e.preventDefault();
+			resultsWrap.innerHTML = '';
+			bar.style.width = '0%';
+			progressText.textContent = 'Starting…';
+			progressWrap.style.display = '';
+			const formData = new FormData(form);
+			const startRes = await fetch('/start', { method: 'POST', body: formData });
+			const startData = await startRes.json();
+			const jobId = startData.job_id;
+			if (!jobId) { progressText.textContent = 'Error starting job.'; return; }
+			if (pollTimer) clearInterval(pollTimer);
+			pollTimer = setInterval(async () => {
+				const progRes = await fetch(`/progress/${jobId}`);
+				const prog = await progRes.json();
+				const total = prog.total || 0, processed = prog.processed || 0;
+				const pct = total > 0 ? Math.floor(processed * 100 / total) : 0;
+				bar.style.width = pct + '%';
+				progressText.textContent = prog.done ? 'Finalizing…' : `Scanning PDFs: ${processed} / ${total}`;
+				if (prog.done) {
+					clearInterval(pollTimer);
+					const resRes = await fetch(`/results/${jobId}`);
+					const data = await resRes.json();
+					renderTable(data.results || []);
+					const dl = document.createElement('a');
+					dl.textContent = 'Download CSV';
+					dl.href = `/download/${jobId}`;
+					dl.setAttribute('download', 'form019_matches.csv');
+					resultsWrap.prepend(dl);
+					progressText.textContent = `Done. ${processed} PDFs scanned.`;
+				}
+			}, 500);
+		});
+	})();
+	</script>
 </body>
 </html>
 """
@@ -285,60 +363,68 @@ def _parse_float(value: str) -> Optional[float]:
 		return None
 
 
-def _collect_results(base_dir: Path, selected_rens: Sequence[str], part_type: str, thresholds: Thresholds) -> List[Dict[str, object]]:
-	results: List[Dict[str, object]] = []
-	for cmd_dir in iter_job_cmd_dirs(base_dir, selected_rens):
-		pdfs = find_form19_pdfs(cmd_dir)
-		for pdf in pdfs:
-			rows = scan_pdf(pdf, part_type, thresholds)
-			results.extend(rows)
-	return results
-
-
 @app.get("/")
 def index() -> str:
 	return render_template_string(
 		TEMPLATE,
 		base_dir=DEFAULT_BASE_DIR,
-		selected_rens=REN_FOLDERS,
 		part_types=PART_TYPES,
 		part_type=PART_TYPES[0],
 	)
 
 
-@app.post("/")
-def search() -> str:
+@app.post("/start")
+def start() -> Response:
 	base_dir_str = request.form.get("base_dir", DEFAULT_BASE_DIR)
-	selected_rens = request.form.getlist("ren") or REN_FOLDERS
 	part_type = request.form.get("part_type", PART_TYPES[0])
 	ap_b = request.form.get("ap_b", "").strip()
 	ml_a = request.form.get("ml_a", "").strip()
 	max_c = request.form.get("max_c", "").strip()
+	ap_op = request.form.get("ap_op", ">=")
+	ml_op = request.form.get("ml_op", ">=")
+	max_op = request.form.get("max_op", ">=")
 	thresholds = Thresholds(
 		ap_depth_b_mm=_parse_float(ap_b),
+		ap_op=ap_op if ap_op in (">=", "<=") else ">=",
 		ml_width_a_mm=_parse_float(ml_a),
+		ml_op=ml_op if ml_op in (">=", "<=") else ">=",
 		max_cage_height_c_mm=_parse_float(max_c),
+		max_op=max_op if max_op in (">=", "<=") else ">=",
 	)
 	base_dir = Path(base_dir_str)
-	results = _collect_results(base_dir, selected_rens, part_type, thresholds)
-	csv_data = results_to_csv(results)
-	return render_template_string(
-		TEMPLATE,
-		base_dir=str(base_dir),
-		selected_rens=selected_rens,
-		part_types=PART_TYPES,
-		part_type=part_type,
-		ap_b=ap_b,
-		ml_a=ml_a,
-		max_c=max_c,
-		results=results,
-		csv_data=csv_data,
-	)
+	job_id = uuid.uuid4().hex
+	with JOBS_LOCK:
+		JOBS[job_id] = {"total": 0, "processed": 0, "done": False, "results": [], "csv": "", "error": None}
+	thread = Thread(target=_run_job, args=(job_id, base_dir, part_type, thresholds), daemon=True)
+	thread.start()
+	return jsonify({"job_id": job_id})
 
 
-@app.post("/download")
-def download_csv() -> Response:
-	csv_data = request.form.get("csv", "")
+@app.get("/progress/<job_id>")
+def progress(job_id: str) -> Response:
+	with JOBS_LOCK:
+		info = JOBS.get(job_id)
+		if not info:
+			return jsonify({"error": "not_found"}), 404
+		return jsonify({"total": info.get("total", 0), "processed": info.get("processed", 0), "done": info.get("done", False), "error": info.get("error")})
+
+
+@app.get("/results/<job_id>")
+def get_results(job_id: str) -> Response:
+	with JOBS_LOCK:
+		info = JOBS.get(job_id)
+		if not info:
+			return jsonify({"error": "not_found"}), 404
+		return jsonify({"results": info.get("results", [])})
+
+
+@app.get("/download/<job_id>")
+def download_csv(job_id: str) -> Response:
+	with JOBS_LOCK:
+		info = JOBS.get(job_id)
+		if not info:
+			return Response("not found", status=404)
+		csv_data = info.get("csv", "") or ""
 	response = Response(csv_data, mimetype="text/csv; charset=utf-8")
 	response.headers["Content-Disposition"] = "attachment; filename=form019_matches.csv"
 	return response
